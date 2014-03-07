@@ -680,6 +680,7 @@ class GCENodeDriver(NodeDriver):
             self.connection.request_path = save_request_path
         list_images = [self._to_node_image(i) for i in
                        response.get('items', [])]
+        
         return list_images
 
     def list_locations(self):
@@ -741,6 +742,9 @@ class GCENodeDriver(NodeDriver):
                     list_nodes.extend(zone_nodes)
             else:
                 list_nodes = [self._to_node(i) for i in response['items']]
+                
+        list_volumes = self.list_volumes(ex_zone=ex_zone)
+        self._add_bootvolume_info(list_volumes,list_nodes)
         return list_nodes
 
     def ex_list_regions(self):
@@ -853,13 +857,17 @@ class GCENodeDriver(NodeDriver):
         if 'items' in response:
             # The aggregated response returns a dict for each zone
             if zone is None:
-                for v in response['items'].values():
+                for z,v in response['items'].items():
                     zone_volumes = [self._to_storage_volume(d) for d in
                                     v.get('disks', [])]
+                    for volume in zone_volumes:
+                        volume.extra['zone'] = self.ex_get_zone(z)
                     list_volumes.extend(zone_volumes)
             else:
                 list_volumes = [self._to_storage_volume(d) for d in
                                 response['items']]
+                for volume in list_volumes:
+                        volume.extra['zone'] = zone
         return list_volumes
 
     def ex_list_zones(self):
@@ -1289,6 +1297,7 @@ class GCENodeDriver(NodeDriver):
                 if status['disk'] and not status['node']:
                     if not status['node_response']:
                         self._multi_create_node(status, node_attrs)
+                        node_requested = True
                     else:
                         self._multi_check_node(status, node_attrs)
                 # If any of the nodes have not been created (or failed) we are
@@ -2209,7 +2218,12 @@ class GCENodeDriver(NodeDriver):
             name, 'instances', res_name='Node')
         request = '/zones/%s/instances/%s' % (zone.name, name)
         response = self.connection.request(request, method='GET').object
-        return self._to_node(response)
+        node = self._to_node(response)
+        for disk in node.extra['disks']:
+            if disk.get('boot') and disk.get('type') == 'PERSISTENT':
+                bd = self._get_components_from_path(disk['source'])
+                node.extra['boot_disk'] = self.ex_get_volume(bd['name'], bd['zone'])
+        return node
 
     def ex_get_project(self):
         """
@@ -2275,7 +2289,9 @@ class GCENodeDriver(NodeDriver):
             name, 'disks', res_name='Volume')
         request = '/zones/%s/disks/%s' % (zone.name, name)
         response = self.connection.request(request, method='GET').object
-        return self._to_storage_volume(response)
+        volume = self._to_storage_volume(response)
+        volume.extra['zone'] = zone
+        return  volume
 
     def ex_get_region(self, name):
         """
@@ -2349,6 +2365,31 @@ class GCENodeDriver(NodeDriver):
     def _ex_connection_class_kwargs(self):
         return {'auth_type': self.auth_type,
                 'project': self.project}
+
+    def _add_bootvolume_info(self, volumes, nodes):
+        """
+        Add boot volume info to a set of nodes
+        
+        :param  volumes: Volume info for the nodes to be assigned from
+        :type   volumes: ``list`` of :class:`StorageVolume`
+        
+        :param  volumes: A list of the nodes to be modified
+        :type   volumes: ``list`` of :class:'Node"
+
+        
+        :return:  None
+        """
+        volume_lookup = {(volume.name, volume.extra['zone'].name): volume for volume in volumes}
+
+        for node in nodes:
+            for disk in node.extra['disks']:
+                if disk.get('boot') and disk.get('type') == 'PERSISTENT':
+                    bd = self._get_components_from_path(disk['source'])
+                    bootvolume = volume_lookup.get((bd['name'], bd['zone']))
+                    node.extra['boot_disk'] = bootvolume
+
+            
+
 
     def _catch_error(self, ignore_errors=False):
         """
@@ -2969,12 +3010,7 @@ class GCENodeDriver(NodeDriver):
         extra['metadata'] = node.get('metadata', {})
         extra['tags_fingerprint'] = node['tags']['fingerprint']
         extra['scheduling'] = node.get('scheduling', {})
-
         extra['boot_disk'] = None
-        for disk in extra['disks']:
-            if disk.get('boot') and disk.get('type') == 'PERSISTENT':
-                bd = self._get_components_from_path(disk['source'])
-                extra['boot_disk'] = self.ex_get_volume(bd['name'], bd['zone'])
 
         if 'items' in node['tags']:
             tags = node['tags']['items']
@@ -3105,7 +3141,7 @@ class GCENodeDriver(NodeDriver):
         """
         extra = {}
         extra['selfLink'] = volume.get('selfLink')
-        extra['zone'] = self.ex_get_zone(volume['zone'])
+        extra['zone'] = None 
         extra['status'] = volume.get('status')
         extra['creationTimestamp'] = volume.get('creationTimestamp')
         extra['description'] = volume.get('description')
